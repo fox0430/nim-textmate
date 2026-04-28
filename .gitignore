@@ -1,0 +1,10 @@
+textmate.out
+
+textmate/*
+!textmate/*.*
+
+examples/*
+!examples/*.*
+
+tests/*
+!tests/*.*
