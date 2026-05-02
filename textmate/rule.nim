@@ -262,6 +262,12 @@ proc compileGrammar*(raw: RawGrammar): Grammar =
   ## Raises ``GrammarError`` if any pattern's regex fails to compile or
   ## if an `include` target is malformed (empty, lone `#`, unknown
   ## `$directive`, etc.).
+  ##
+  ## Each `Grammar` returned by `compileGrammar` is **thread-confined**:
+  ## tokenise it from one thread only. For parallel tokenisation, call
+  ## `compileGrammar` once per worker thread — `RawGrammar` is plain
+  ## data and may be shared. The same restriction applies to a
+  ## `Registry` and the grammars it owns.
   result = Grammar(scopeName: raw.scopeName)
   result.rootRules = compilePatternList(raw.patterns, result, "patterns")
   for key, value in raw.repository.pairs:
