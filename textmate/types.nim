@@ -116,12 +116,16 @@ type
         ## `scopeName` (empty string when no base is in scope). Cleared
         ## by `registry.addGrammar` whenever a cross-grammar link is
         ## newly satisfied so stale entries never outlive a link change.
+        ## Single-threaded; `Grammar` is thread-confined (see
+        ## `compileGrammar`).
       resolvedTerminatorCache*: Table[string, Regex]
         ## Phase 6: memoised compilation of terminator patterns after
         ## begin→terminator backreference substitution. Key is the final
         ## substituted pattern string; hit avoids a fresh `re(...)` call
         ## on every begin push. Only populated when
         ## `terminatorHasBackrefs`. Never stores failed compilations.
+        ## Single-threaded; `Grammar` is thread-confined (see
+        ## `compileGrammar`).
 
   ResolvedRule* = tuple[rule: Rule, grammar: Grammar]
 
@@ -154,7 +158,8 @@ type
       ## the flattened `(rule, owning grammar)` sequence with every
       ## `rkInclude` entry already resolved. Populated by
       ## `expandRootRules` and cleared when a cross-grammar link is
-      ## newly satisfied.
+      ## newly satisfied. Single-threaded; `Grammar` is thread-confined
+      ## (see `compileGrammar`).
     injections*: seq[CompiledInjection]
       ## Grammar-level injections compiled from `RawGrammar.injections`.
     injectionSelector*: SelectorExpr
@@ -250,20 +255,25 @@ type
     isMiss*: bool
 
   LineScanner* = object
-    ## Internal cache keyed by `Rule` identity that memoises `search`
-    ## results across a single line tokenisation. See `ScannerEntry`.
-    ## Scoped to one `tokenizeLine` invocation; never reused across
+    ## Internal cache and scratch buffer used by `tokenizeLine` /
+    ## `tokenizeRange`. See `ScannerEntry`.
+    ##
+    ## `entries` memoises `search` results keyed by `Rule` identity.
+    ## Scoped to a single `tokenizeLine` invocation; never reused across
     ## lines. The key is the `Rule` object itself (pointer identity via
     ## `tokenizer.hash`) because `RuleId` is only unique per grammar —
-    ## cross-grammar includes can collide on numeric ids.
+    ## cross-grammar includes can collide on numeric ids. Storing the
+    ## map on the scanner (rather than as transient fields on `Rule`)
+    ## keeps the cache scoped to one `tokenizeLine` invocation; reuse
+    ## across lines would alias different line buffers.
     ##
-    ## `ctx` is a reusable reni scratch buffer shared by every
-    ## `searchIntoCtx` invocation within a single `tokenizeLine` call
-    ## (and within a single `tokenizeRange` call). After reni's first
-    ## `searchIntoCtx` for a given rule, subsequent calls reuse
-    ## `ctx`'s `captures` / `groupRecursionDepth` / `captureStacks`
-    ## seqs — no fresh heap alloc per regex dispatch. Populated at
-    ## `LineScanner` construction time.
+    ## `ctx` is a reusable reni scratch buffer with a different
+    ## lifetime: one instance per thread, shared across every
+    ## `tokenizeLine` and `tokenizeRange` call on that thread. reni's
+    ## `searchIntoCtx` reuses `ctx`'s `captures` / `groupRecursionDepth`
+    ## / `captureStacks` seqs across calls — no fresh heap alloc per
+    ## regex dispatch. Cross-call sharing is safe because reni's
+    ## `Match` owns its `boundaries` seq independently of `ctx`.
     entries*: Table[Rule, ScannerEntry]
     lineLen*: int
     ctx*: MatchContext

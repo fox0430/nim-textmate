@@ -9,3 +9,7 @@ license = "MIT"
 
 requires "nim >= 2.0.0"
 requires "reni >= 0.1.0"
+
+task bench, "Run the textmate + reni benchmark suite":
+  exec "nim c -d:release -r bench/bench_textmate.nim"
+  exec "nim c -d:release -r bench/bench_reni.nim"

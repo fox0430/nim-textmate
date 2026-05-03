@@ -3,6 +3,9 @@
 ## Minimal scope (match rules only): parse a tmLanguage grammar (JSON), register
 ## it with a `Registry`, and tokenize lines via `tokenizeLine`.
 ##
+## `Grammar` is thread-confined: compile one per thread for parallel
+## tokenisation. See README "Threading" for the rationale.
+##
 ## Basic usage
 ## ===========
 ##
@@ -44,6 +47,7 @@ export
   detectGrammar,
   initialStack,
   tokenizeLine,
+  clearTokenizerScratch,
   tokenizeDocument,
   tokenizeDocumentIter,
   newScopeIdMap,

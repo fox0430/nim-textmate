@@ -331,6 +331,59 @@ suite "capture patterns":
     check lt.tokens[3].endIndex == 8
     check lt.tokens[3].scopes == @["source.test", "meta.outer"]
 
+  test "nested capture patterns recurse into tokenizeRange twice on the same line":
+    # Regression for the shared `MatchContext` contract: when a
+    # capture's `patterns` contain a rule whose own captures also have
+    # `patterns`, `tokenizeRange` is invoked recursively while the
+    # parent call still holds a `Match` value. This exercise both
+    # depth-1 and depth-2 `tokenizeRange` frames against the same
+    # thread-local ctx so any aliasing of `Match.boundaries` into ctx
+    # scratch would surface as garbled scopes or off-by-one spans.
+    let jsonStr = """
+    {
+      "scopeName": "source.test",
+      "patterns": [ {
+        "match": "(\\w+)",
+        "name": "outer",
+        "captures": {
+          "1": {
+            "name": "cap1",
+            "patterns": [ {
+              "match": "([a-z]+)(\\d+)",
+              "name": "mid",
+              "captures": {
+                "1": {
+                  "name": "midL",
+                  "patterns": [ { "match": "[a-z]", "name": "ch" } ]
+                },
+                "2": {
+                  "name": "midD",
+                  "patterns": [ { "match": "\\d", "name": "dg" } ]
+                }
+              }
+            } ]
+          }
+        }
+      } ]
+    }
+    """
+    let g = compileGrammar(parseRawGrammar(jsonStr))
+    let lt = tokenizeLine("ab12", initialStack(g))
+
+    check lt.tokens.len == 4
+    check lt.tokens[0].startIndex == 0
+    check lt.tokens[0].endIndex == 1
+    check lt.tokens[0].scopes == @["source.test", "outer", "cap1", "mid", "midL", "ch"]
+    check lt.tokens[1].startIndex == 1
+    check lt.tokens[1].endIndex == 2
+    check lt.tokens[1].scopes == @["source.test", "outer", "cap1", "mid", "midL", "ch"]
+    check lt.tokens[2].startIndex == 2
+    check lt.tokens[2].endIndex == 3
+    check lt.tokens[2].scopes == @["source.test", "outer", "cap1", "mid", "midD", "dg"]
+    check lt.tokens[3].startIndex == 3
+    check lt.tokens[3].endIndex == 4
+    check lt.tokens[3].scopes == @["source.test", "outer", "cap1", "mid", "midD", "dg"]
+
   test "cross-grammar repo include (source.xxx#name) inside capture patterns":
     # `source.inner#num` targets a single repository entry. Siblings in
     # the inner grammar's repository must not leak into the captured

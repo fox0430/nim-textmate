@@ -13,6 +13,29 @@ type CaptureEntry = object
 proc hash(r: Rule): Hash {.inline.} =
   hash(cast[pointer](r))
 
+# Thread-local scratch shared across every `tokenizeLine` / `tokenizeRange`
+# invocation on this thread. `MatchContext` is reni's reusable scratch
+# buffer; reusing it eliminates the per-line allocation/destroy that the
+# previous `newMatchContext()` per LineScanner pattern incurred. Each
+# thread holds its own reni scratch buffer via `{.threadvar.}`; combined
+# with thread-confined `Grammar`, no cross-thread state remains.
+var sharedMatchCtx {.threadvar.}: MatchContext
+
+proc getMatchContext(): MatchContext {.inline.} =
+  if sharedMatchCtx.isNil:
+    sharedMatchCtx = newMatchContext()
+  sharedMatchCtx
+
+proc clearTokenizerScratch*() =
+  ## Drop this thread's reusable `MatchContext`. Useful before a
+  ## short-lived worker terminates: Nim's ORC does not run destructors
+  ## for `{.threadvar.}` refs at thread exit, so the few-KB scratch
+  ## buffer that `tokenizeLine` lazily allocated would otherwise be
+  ## leaked until process exit. Long-lived workers do not need to call
+  ## this — a subsequent `tokenizeLine` on the same thread will
+  ## allocate a fresh ctx if needed.
+  sharedMatchCtx = nil
+
 proc safeAdvance*(line: string, pos: int): int {.inline.} =
   ## UTF-8 safe forward step. Guarantees `result > pos`. Falls back to
   ## manual continuation-byte skipping when `nextRunePos` cannot advance
@@ -322,18 +345,17 @@ proc resolveTerminatorRegex(
   # begin matches on one line (and across lines); caching saves a fresh
   # `re(...)` parse/compile on each push. Failures are never cached so a
   # later retry still surfaces the error.
-  if rule.resolvedTerminatorCache.hasKey(resolved):
-    return (rule.resolvedTerminatorCache[resolved], resolved)
-  let compiled =
-    try:
-      re(resolved)
-    except CatchableError as e:
-      raise newException(
-        GrammarError,
-        "failed to compile resolved terminator pattern '" & resolved & "': " & e.msg,
-      )
-  rule.resolvedTerminatorCache[resolved] = compiled
-  (compiled, resolved)
+  if not rule.resolvedTerminatorCache.hasKey(resolved):
+    let compiled =
+      try:
+        re(resolved)
+      except CatchableError as e:
+        raise newException(
+          GrammarError,
+          "failed to compile resolved terminator pattern '" & resolved & "': " & e.msg,
+        )
+    rule.resolvedTerminatorCache[resolved] = compiled
+  (rule.resolvedTerminatorCache[resolved], resolved)
 
 proc baseGrammar(s: StackElement): Grammar =
   ## Return the grammar at the bottom of the stack. This is the "root"
@@ -455,19 +477,23 @@ proc expandRootRules(selfG: Grammar, baseG: Grammar): seq[ResolvedRule] =
   ## `selfG.rootRules`. Memoises on `selfG.expansionCache[baseScope]`;
   ## the cache is cleared by `addGrammar` when a cross-grammar link
   ## newly resolves, so stale entries never outlive a link change.
+  ##
+  ## Always returns a fresh read from the cache so the cache value
+  ## (not a moved-from local) is what flows out — `Table.[]=` `sink`s
+  ## its argument under ARC/ORC, which would otherwise leave the local
+  ## empty.
   if selfG == nil or selfG.rootRules.len == 0:
     return @[]
   let baseScope = if baseG != nil: baseG.scopeName else: ""
-  if selfG.expansionCache.hasKey(baseScope):
-    return selfG.expansionCache[baseScope]
-  result = expandRules(selfG.rootRules, selfG, baseG)
-  selfG.expansionCache[baseScope] = result
+  if not selfG.expansionCache.hasKey(baseScope):
+    selfG.expansionCache[baseScope] = expandRules(selfG.rootRules, selfG, baseG)
+  selfG.expansionCache[baseScope]
 
 proc scannerSearchRule(
     scanner: var LineScanner, line: string, pos: int, rule: Rule
 ): Match =
   ## Memoised per-line `search` dispatch. For a given line, each
-  ## `rule.id` is searched at most once per monotonically-advancing
+  ## `rule` is searched at most once per monotonically-advancing
   ## `pos`: when the cached leftmost match still starts at or after
   ## `pos`, it is reused; when a prior search already determined the
   ## rule has no match in the line (relative to a prior `pos`), the
@@ -489,10 +515,7 @@ proc scannerSearchRule(
   let regex = if rule.kind == rkMatch: rule.matchRegex else: rule.beginRegex
   var m: Match
   discard searchIntoCtx(scanner.ctx, line, regex, m, start = pos)
-  if m.found:
-    scanner.entries[rule] = ScannerEntry(match: m, queryPos: pos, isMiss: false)
-  else:
-    scanner.entries[rule] = ScannerEntry(match: m, queryPos: pos, isMiss: true)
+  scanner.entries[rule] = ScannerEntry(match: m, queryPos: pos, isMiss: not m.found)
   m
 
 proc findNextMatchIn(
@@ -590,25 +613,20 @@ proc findNextMatchEffective(
       result.match = m
       result.grammar = entry.grammar
 
-proc findNextMatch(
-    line: string, pos: int, selfG: Grammar, baseG: Grammar, scanner: var LineScanner
-): tuple[rule: Rule, match: Match, grammar: Grammar] =
-  ## Leftmost-wins search across `selfG.rootRules`. See `findNextMatchIn`.
-  findNextMatchIn(line, pos, expandRootRules(selfG, baseG), scanner)
-
 proc expandRulePatterns(rule: Rule, selfG, baseG: Grammar): seq[ResolvedRule] =
   ## Cached wrapper around `expandRules` for an `rkBeginEnd` rule's
   ## `patterns` sub-list. Keyed by the base grammar's `scopeName` so a
   ## rule reused with different `$base` contexts does not collide. The
   ## cache is cleared by `registry.addGrammar` when a cross-grammar link
-  ## is newly satisfied.
+  ## is newly satisfied. See `expandRootRules` for the `Table.[]=` sink
+  ## pitfall that motivates returning the cache value rather than the
+  ## just-computed local.
   if rule.patterns.len == 0:
     return @[]
   let baseScope = if baseG != nil: baseG.scopeName else: ""
-  if rule.patternExpansionCache.hasKey(baseScope):
-    return rule.patternExpansionCache[baseScope]
-  result = expandRules(rule.patterns, selfG, baseG)
-  rule.patternExpansionCache[baseScope] = result
+  if not rule.patternExpansionCache.hasKey(baseScope):
+    rule.patternExpansionCache[baseScope] = expandRules(rule.patterns, selfG, baseG)
+  rule.patternExpansionCache[baseScope]
 
 proc tokenizeRange(
     line: string,
@@ -656,7 +674,15 @@ proc tokenizeRange(
   # matches are filtered (e.g. `span.b > endPos`). A shared scanner
   # would risk returning a cached match that is outside this range or
   # that came from a prior visitedRules snapshot.
-  var localScanner = LineScanner(lineLen: line.len, ctx: newMatchContext())
+  #
+  # The `ctx` itself is shared with the caller via `getMatchContext()`
+  # — safe because reni's `Match` is `object { found: bool, boundaries:
+  # seq[Span] }` and owns its `boundaries` seq. Each `searchIntoCtx`
+  # writes a fresh result into its `var Match` output; the ctx only
+  # holds resettable scratch (`captures` / `groupRecursionDepth` /
+  # `captureStacks`). So a nested `searchIntoCtx` here does not
+  # invalidate any `Match` value the caller is still holding.
+  var localScanner = LineScanner(lineLen: line.len, ctx: getMatchContext())
   var pos = startPos
   while pos < endPos:
     let next = findNextMatchIn(line, pos, matchOnly, localScanner)
@@ -727,7 +753,42 @@ proc tokenizeLine*(line: string, stack: StackElement): LineTokens =
   # always correct to reuse. The scanner covers `findNextMatch*` calls;
   # while-preamble and begin/end terminator searches bypass it because
   # their regexes live on the stack element, not the rule.
-  var scanner = LineScanner(lineLen: line.len, ctx: newMatchContext())
+  var scanner = LineScanner(lineLen: line.len, ctx: getMatchContext())
+
+  # Cached `expandRootRules(curStack.grammar, baseG)`. The cache is
+  # consulted only when `curStack.rule == nil` (root frame) — the
+  # begin/end branch uses `expandRulePatterns` instead. While push/pop
+  # transitions never enter the root branch with a different grammar
+  # within one `tokenizeLine` call (every push lands on `rkBeginEnd` /
+  # `rkBeginWhile` and the begin/end branch handles those frames), the
+  # ref-equality guard makes the invariant local: the cache stays
+  # valid as long as the grammar at the top of the stack is unchanged,
+  # and any future relaxation of the "root frame only" property will
+  # invalidate correctly. Eliminates the per-iteration
+  # `expansionCache.hasKey(baseScope)` string-hash lookup that used to
+  # dominate the perf profile.
+  var rootRulesGrammar: Grammar = nil
+  var rootRulesCached: seq[ResolvedRule]
+  template ensureRootRules() =
+    if rootRulesGrammar != curStack.grammar:
+      rootRulesCached = expandRootRules(curStack.grammar, baseG)
+      rootRulesGrammar = curStack.grammar
+
+  # Cached `expandRulePatterns(curStack.rule, curStack.grammar, baseG)`.
+  # Within one begin/end frame, `curStack.rule` and `curStack.grammar`
+  # are immutable (push/pop replaces the whole frame), so the cache
+  # stays valid as long as `curStack.rule` is unchanged. Avoids
+  # re-walking the `expandRulePatterns` cache lookup on every iteration
+  # of the begin/end branch's main loop.
+  var nestedRulesRule: Rule = nil
+  var nestedRulesCached: seq[ResolvedRule]
+  template ensureNestedRules() =
+    if nestedRulesRule != curStack.rule:
+      if curStack.rule != nil and curStack.rule.patterns.len > 0:
+        nestedRulesCached = expandRulePatterns(curStack.rule, curStack.grammar, baseG)
+      else:
+        nestedRulesCached.setLen(0)
+      nestedRulesRule = curStack.rule
 
   # Injection evaluation caches. `hasInj` and `cachedInjections` depend
   # only on `curStack.grammar` and `fullScopes(curStack)`, both of which
@@ -812,18 +873,15 @@ proc tokenizeLine*(line: string, stack: StackElement): LineTokens =
       # Tie at the same start position goes to end (Phase 5 will honour
       # `applyEndPatternLast` to optionally flip this).
       var nested: tuple[rule: Rule, match: Match, grammar: Grammar]
-      let expanded =
-        if rule.patterns.len > 0:
-          expandRulePatterns(rule, curStack.grammar, baseG)
-        else:
-          @[]
+      ensureNestedRules()
       ensureInjectionCache()
       if hasInj:
-        if expanded.len > 0 or cachedInjections.len > 0:
-          nested =
-            findNextMatchEffective(line, pos, expanded, cachedInjections, scanner)
-      elif expanded.len > 0:
-        nested = findNextMatchIn(line, pos, expanded, scanner)
+        if nestedRulesCached.len > 0 or cachedInjections.len > 0:
+          nested = findNextMatchEffective(
+            line, pos, nestedRulesCached, cachedInjections, scanner
+          )
+      elif nestedRulesCached.len > 0:
+        nested = findNextMatchIn(line, pos, nestedRulesCached, scanner)
       let nestedFound = not nested.rule.isNil
       let nestedStart =
         if nestedFound:
@@ -918,11 +976,12 @@ proc tokenizeLine*(line: string, stack: StackElement): LineTokens =
 
     var next: tuple[rule: Rule, match: Match, grammar: Grammar]
     ensureInjectionCache()
+    ensureRootRules()
     if hasInj:
-      let baseRules = expandRootRules(curStack.grammar, baseG)
-      next = findNextMatchEffective(line, pos, baseRules, cachedInjections, scanner)
+      next =
+        findNextMatchEffective(line, pos, rootRulesCached, cachedInjections, scanner)
     else:
-      next = findNextMatch(line, pos, curStack.grammar, baseG, scanner)
+      next = findNextMatchIn(line, pos, rootRulesCached, scanner)
     if next.rule.isNil:
       addToken(result.tokens, pos, line.len, baseScopes)
       break

@@ -48,6 +48,23 @@ A TextMate grammar parser in Nim.
   untouched.
 - A benchmark fixture is provided under `bench/` (`nimble bench`).
 
+### Threading
+
+`Grammar` instances are **thread-confined** — a compiled `Grammar`
+must only be tokenised against from one thread. To tokenise in
+parallel, call `compileGrammar` once per worker thread (the
+`RawGrammar` returned by `parseRawGrammar` is plain data; the
+underlying JSON literal or string is also safe to share). Each thread
+amortises the compile cost across all lines it processes.
+
+`Registry` follows the same contract: register grammars from the
+thread that will use them. `addGrammar` mutates registry-wide state
+and clears caches on grammars it owns, so it is not safe to call
+concurrently with tokenisation.
+
+`Theme` is similarly single-threaded — `resolveTheme` mutates
+per-theme scratch (`seenMarks`).
+
 ## Usage
 
 ### Single-line tokenisation

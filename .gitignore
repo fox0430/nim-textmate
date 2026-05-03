@@ -8,3 +8,10 @@ examples/*
 
 tests/*
 !tests/*.*
+
+bench/*
+!bench/*.*
+bench/*.data
+bench/*.data.old
+
+profile_results.txt
